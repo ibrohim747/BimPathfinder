@@ -21,7 +21,7 @@ namespace BimPathfinder
         }
 
         // ─────────────────────────────────────────────────────────────
-        // Pipe
+        // PIPE
         // ─────────────────────────────────────────────────────────────
 
         public List<Pipe> BuildPipes(
@@ -31,11 +31,12 @@ namespace BimPathfinder
             double diameterMm)
         {
             if (pathPts == null || pathPts.Count < 2)
-                throw new ArgumentException("Путь содержит менее 2 точек.");
+                throw new ArgumentException("The path contains fewer than 2 points.");
 
             double diamFt = diameterMm / 304.8;
             var pipes = new List<Pipe>();
 
+            // ── Step 1: create all segments XYZ → XYZ ─────────────────
             for (int i = 0; i < pathPts.Count - 1; i++)
             {
                 XYZ start = pathPts[i];
@@ -44,12 +45,7 @@ namespace BimPathfinder
                 if (start.DistanceTo(end) < 1e-6) continue;
 
                 var pipe = Pipe.Create(
-                    _doc,
-                    systemType.Id,
-                    pipeType.Id,
-                    _level.Id,
-                    start,
-                    end);
+                    _doc, systemType.Id, pipeType.Id, _level.Id, start, end);
 
                 pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
                     ?.Set(diamFt);
@@ -57,13 +53,42 @@ namespace BimPathfinder
                 pipes.Add(pipe);
             }
 
-            ConnectPipesWithElbows(pipes);
+            // ── Step 2: explicitly create Elbow fittings between adjacent segments ──
+            InsertPipeElbows(pipes);
 
             return pipes;
         }
 
+        /// <summary>
+        /// Creates elbow fittings via doc.Create.NewElbowFitting(c1, c2).
+        /// This is the only reliable approach — independent of Routing Preferences.
+        /// </summary>
+        private void InsertPipeElbows(List<Pipe> pipes)
+        {
+            for (int i = 0; i < pipes.Count - 1; i++)
+            {
+                // Collinear segments — no fitting needed
+                if (AreCollinear(pipes[i], pipes[i + 1])) continue;
+
+                Connector c1 = GetConnectorNear(pipes[i], GetEndPoint(pipes[i]));
+                Connector c2 = GetConnectorNear(pipes[i + 1], GetStartPoint(pipes[i + 1]));
+
+                if (c1 == null || c2 == null) continue;
+
+                try
+                {
+                    _doc.Create.NewElbowFitting(c1, c2);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[BimPathfinder] Pipe elbow [{i}]: {ex.Message}");
+                }
+            }
+        }
+
         // ─────────────────────────────────────────────────────────────
-        // Duct
+        // DUCT
         // ─────────────────────────────────────────────────────────────
 
         public List<Duct> BuildDucts(
@@ -74,12 +99,13 @@ namespace BimPathfinder
             double heightMm)
         {
             if (pathPts == null || pathPts.Count < 2)
-                throw new ArgumentException("Путь содержит менее 2 точек.");
+                throw new ArgumentException("The path contains fewer than 2 points.");
 
             double wFt = widthMm / 304.8;
             double hFt = heightMm / 304.8;
             var ducts = new List<Duct>();
 
+            // ── Step 1: create all segments XYZ → XYZ ─────────────────
             for (int i = 0; i < pathPts.Count - 1; i++)
             {
                 XYZ start = pathPts[i];
@@ -88,12 +114,7 @@ namespace BimPathfinder
                 if (start.DistanceTo(end) < 1e-6) continue;
 
                 var duct = Duct.Create(
-                    _doc,
-                    systemType.Id,
-                    ductType.Id,
-                    _level.Id,
-                    start,
-                    end);
+                    _doc, systemType.Id, ductType.Id, _level.Id, start, end);
 
                 duct.get_Parameter(BuiltInParameter.RBS_CURVE_WIDTH_PARAM)?.Set(wFt);
                 duct.get_Parameter(BuiltInParameter.RBS_CURVE_HEIGHT_PARAM)?.Set(hFt);
@@ -101,69 +122,102 @@ namespace BimPathfinder
                 ducts.Add(duct);
             }
 
+            // ── Step 2: explicitly create Elbow fittings ──────────────
+            InsertDuctElbows(ducts);
+
             return ducts;
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // Соединение труб фитингами (Elbow)
-        // ─────────────────────────────────────────────────────────────
-
-        private static void ConnectPipesWithElbows(List<Pipe> pipes)
+        private void InsertDuctElbows(List<Duct> ducts)
         {
-            for (int i = 0; i < pipes.Count - 1; i++)
+            for (int i = 0; i < ducts.Count - 1; i++)
             {
-                var p1 = pipes[i];
-                var p2 = pipes[i + 1];
+                if (AreCollinear(ducts[i], ducts[i + 1])) continue;
 
-                var c1 = GetConnectorClosestTo(p1, GetEndPoint(p1));
-                var c2 = GetConnectorClosestTo(p2, GetStartPoint(p2));
+                Connector c1 = GetConnectorNear(ducts[i], GetEndPoint(ducts[i]));
+                Connector c2 = GetConnectorNear(ducts[i + 1], GetStartPoint(ducts[i + 1]));
 
                 if (c1 == null || c2 == null) continue;
 
                 try
                 {
-                    c1.ConnectTo(c2);
+                    _doc.Create.NewElbowFitting(c1, c2);
                 }
-                catch
+                catch (Exception ex)
                 {
-
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[BimPathfinder] Duct elbow [{i}]: {ex.Message}");
                 }
             }
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // Geometry helpers
+        // ─────────────────────────────────────────────────────────────
 
         private static XYZ GetStartPoint(MEPCurve curve)
-        {
-            var loc = curve.Location as LocationCurve;
-            return loc?.Curve.GetEndPoint(0);
-        }
+            => (curve.Location as LocationCurve)?.Curve.GetEndPoint(0);
 
         private static XYZ GetEndPoint(MEPCurve curve)
-        {
-            var loc = curve.Location as LocationCurve;
-            return loc?.Curve.GetEndPoint(1);
-        }
+            => (curve.Location as LocationCurve)?.Curve.GetEndPoint(1);
 
-        private static Connector GetConnectorClosestTo(MEPCurve curve, XYZ pt)
+        /// <summary>
+        /// Finds the unoccupied connector closest to the given point.
+        /// If all connectors are occupied — falls back to the nearest one.
+        /// </summary>
+        private static Connector GetConnectorNear(MEPCurve curve, XYZ pt)
         {
             if (pt == null) return null;
 
-            Connector closest = null;
-            double minDist = double.MaxValue;
+            Connector best = null;
+            double bestDist = double.MaxValue;
 
+            // Priority — free connectors
             foreach (Connector c in curve.ConnectorManager.Connectors)
             {
+                if (c.IsConnected) continue;
                 double d = c.Origin.DistanceTo(pt);
-                if (d < minDist)
+                if (d < bestDist) { bestDist = d; best = c; }
+            }
+
+            // Fallback — any nearest connector
+            if (best == null)
+            {
+                bestDist = double.MaxValue;
+                foreach (Connector c in curve.ConnectorManager.Connectors)
                 {
-                    minDist = d;
-                    closest = c;
+                    double d = c.Origin.DistanceTo(pt);
+                    if (d < bestDist) { bestDist = d; best = c; }
                 }
             }
 
-            return closest;
+            return best;
         }
 
+        /// <summary>
+        /// Two segments are collinear if their direction vectors are parallel.
+        /// In that case no elbow is needed — it would just be a straight pipe.
+        /// </summary>
+        private static bool AreCollinear(MEPCurve a, MEPCurve b)
+        {
+            XYZ a0 = GetStartPoint(a), a1 = GetEndPoint(a);
+            XYZ b0 = GetStartPoint(b), b1 = GetEndPoint(b);
+
+            if (a0 == null || a1 == null || b0 == null || b1 == null) return false;
+
+            double lenA = a0.DistanceTo(a1);
+            double lenB = b0.DistanceTo(b1);
+            if (lenA < 1e-6 || lenB < 1e-6) return false;
+
+            XYZ dirA = (a1 - a0) / lenA;
+            XYZ dirB = (b1 - b0) / lenB;
+
+            return Math.Abs(dirA.DotProduct(dirB)) > 0.9999;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Retrieve types from the document
+        // ─────────────────────────────────────────────────────────────
 
         public static PipeType GetFirstPipeType(Document doc)
         {
@@ -172,7 +226,7 @@ namespace BimPathfinder
                 .Cast<PipeType>()
                 .FirstOrDefault()
                 ?? throw new InvalidOperationException(
-                    "В проекте не найден ни один тип трубы.");
+                    "No pipe type found in the project.");
         }
 
         public static DuctType GetFirstDuctType(Document doc)
@@ -182,7 +236,7 @@ namespace BimPathfinder
                 .Cast<DuctType>()
                 .FirstOrDefault()
                 ?? throw new InvalidOperationException(
-                    "В проекте не найден ни один тип воздуховода.");
+                    "No duct type found in the project.");
         }
 
         public static PipingSystemType GetPipingSystemType(Document doc, string name = null)
@@ -213,22 +267,27 @@ namespace BimPathfinder
             return types.First();
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // Wall penetration warning
+        // ─────────────────────────────────────────────────────────────
+
         public static void ShowPierceWarning(Document doc, List<XYZ> piercePts)
         {
             if (piercePts == null || piercePts.Count == 0) return;
 
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"Трасса пересекает {piercePts.Count} тонких стен.");
-            sb.AppendLine("Координаты точек для размещения гильз (мм):");
+            sb.AppendLine($"The route crosses {piercePts.Count} thin wall(s).");
+            sb.AppendLine("Penetration point coordinates for sleeve placement (mm):");
             sb.AppendLine();
 
             foreach (var pt in piercePts)
-            {
-                sb.AppendLine($"  X={pt.X * 304.8:F0}  Y={pt.Y * 304.8:F0}  Z={pt.Z * 304.8:F0}");
-            }
+                sb.AppendLine(
+                    $"  X={pt.X * 304.8:F0}  " +
+                    $"Y={pt.Y * 304.8:F0}  " +
+                    $"Z={pt.Z * 304.8:F0}");
 
             Autodesk.Revit.UI.TaskDialog.Show(
-                "BIM-Pathfinder A* — Пробивки стен", sb.ToString());
+                "BIM-Pathfinder A* — Wall Penetrations", sb.ToString());
         }
     }
 }

@@ -67,7 +67,7 @@ namespace BimPathfinder
             return path;
         }
 
-        // ── Проверка коллинеарности трёх точек ──────────────────────
+        // ── Check collinearity of three points ───────────────────────
         private static bool AreCollinear(XYZ a, XYZ b, XYZ c)
         {
             XYZ ab = b - a;

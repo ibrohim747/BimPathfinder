@@ -1,48 +1,47 @@
 ﻿using System;
 using System.Collections.Generic;
 using Autodesk.Revit.DB;
-using Autodesk.Revit.DB.Structure;
-using Autodesk.Revit.DB.Visual;
 
 namespace BimPathfinder
 {
     internal sealed class VoxelGrid
     {
-        // ── Константы (переводим мм → футы) ─────────────────────────
         private const double MmToFt = 1.0 / 304.8;
 
-        public const double DefaultStepFt = 200 * MmToFt; 
-        public const double OffsetFt = 1000 * MmToFt; 
-        public const double SupportDistFt = 300 * MmToFt; 
+        public const double DefaultStepFt = 200 * MmToFt;
+        public const double OffsetFt = 1000 * MmToFt;
+        public const double SupportDistFt = 300 * MmToFt;
 
-        // ── Параметры сетки ──────────────────────────────────────────
         public readonly double StepFt;
         public readonly XYZ Origin;
         public readonly int NX, NY, NZ;
 
-        // ── Массив узлов ─────────────────────────────────────────────
         private readonly AStarNode[,,] _nodes;
-
-        // ── Ссылки на Revit ──────────────────────────────────────────
         private readonly Document _doc;
         private readonly View3D _view3D;
         private readonly double _maxPierceFt;
 
-        // ── Публичные свойства ───────────────────────────────────────
         public BoundingBoxXYZ Bounds { get; private set; }
 
-        // ─────────────────────────────────────────────────────────────
+        // ── 6 axial ray directions ───────────────────────────────────
+        private static readonly XYZ[] RayDirs =
+        {
+            XYZ.BasisX,           XYZ.BasisX.Negate(),
+            XYZ.BasisY,           XYZ.BasisY.Negate(),
+            XYZ.BasisZ,           XYZ.BasisZ.Negate(),
+        };
+
         public VoxelGrid(Document doc, View3D view3D,
                          XYZ startPt, XYZ endPt,
                          double maxPierceThicknessMm,
                          double stepMm = 200.0)
         {
-            _doc = doc;
-            _view3D = view3D;
+            // FIXED: check for null immediately to get a meaningful error message
+            _doc = doc ?? throw new ArgumentNullException(nameof(doc));
+            _view3D = view3D ?? throw new ArgumentNullException(nameof(view3D));
             _maxPierceFt = maxPierceThicknessMm * MmToFt;
             StepFt = stepMm * MmToFt;
 
-            // Bounding box с отступом
             double minX = Math.Min(startPt.X, endPt.X) - OffsetFt;
             double minY = Math.Min(startPt.Y, endPt.Y) - OffsetFt;
             double minZ = Math.Min(startPt.Z, endPt.Z);
@@ -51,24 +50,25 @@ namespace BimPathfinder
             double maxY = Math.Max(startPt.Y, endPt.Y) + OffsetFt;
             double maxZ = Math.Max(startPt.Z, endPt.Z);
 
-            // Вертикальные границы — текущий этаж (Z задаётся снаружи через уровни)
+            // Guard against zero height (start.Z == end.Z)
+            if (Math.Abs(maxZ - minZ) < StepFt)
+                maxZ = minZ + StepFt * 2;
+
             Bounds = new BoundingBoxXYZ
             {
                 Min = new XYZ(minX, minY, minZ),
                 Max = new XYZ(maxX, maxY, maxZ)
             };
-
             Origin = Bounds.Min;
 
-            NX = Math.Max(1, (int)Math.Ceiling((maxX - minX) / StepFt));
-            NY = Math.Max(1, (int)Math.Ceiling((maxY - minY) / StepFt));
-            NZ = Math.Max(1, (int)Math.Ceiling((maxZ - minZ) / StepFt));
+            NX = Math.Max(2, (int)Math.Ceiling((maxX - minX) / StepFt) + 1);
+            NY = Math.Max(2, (int)Math.Ceiling((maxY - minY) / StepFt) + 1);
+            NZ = Math.Max(2, (int)Math.Ceiling((maxZ - minZ) / StepFt) + 1);
 
             _nodes = new AStarNode[NX, NY, NZ];
             InitNodes();
         }
 
-        // ── Инициализация координат узлов ────────────────────────────
         private void InitNodes()
         {
             for (int ix = 0; ix < NX; ix++)
@@ -83,20 +83,25 @@ namespace BimPathfinder
                     }
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // FIXED: AnalyzeObstacles
+        // ─────────────────────────────────────────────────────────────
+
         public void AnalyzeObstacles()
         {
-            var hardCats = new List<BuiltInCategory>
+            // ReferenceIntersector: filter for walls + hard structural elements
+            var wallFilter = new ElementCategoryFilter(BuiltInCategory.OST_Walls);
+            var hardFilter = new ElementMulticategoryFilter(new List<BuiltInCategory>
             {
                 BuiltInCategory.OST_StructuralColumns,
                 BuiltInCategory.OST_StructuralFraming,
                 BuiltInCategory.OST_Floors,
                 BuiltInCategory.OST_Ceilings,
-            };
-
-            var wallFilter = new ElementCategoryFilter(BuiltInCategory.OST_Walls);
-            var hardFilter = new ElementMulticategoryFilter(hardCats);
+            });
             var unionFilter = new LogicalOrFilter(wallFilter, hardFilter);
 
+            // FIXED: FindReferenceTarget.Element — the most reliable mode.
+            // Mesh/Face can return null geometry for thin elements.
             var intersector = new ReferenceIntersector(
                 unionFilter,
                 FindReferenceTarget.Element,
@@ -109,54 +114,79 @@ namespace BimPathfinder
                 for (int iy = 0; iy < NY; iy++)
                     for (int iz = 0; iz < NZ; iz++)
                     {
-                        var node = _nodes[ix, iy, iz];
-                        ClassifyNode(node, intersector);
+                        ClassifyNode(_nodes[ix, iy, iz], intersector);
                     }
 
             MarkSupportNodes();
         }
 
-        // ── Классификация одного узла ────────────────────────────────
+        // ─────────────────────────────────────────────────────────────
+        // FIXED: ClassifyNode — cast rays in all 6 directions
+        // ─────────────────────────────────────────────────────────────
+
         private void ClassifyNode(AStarNode node, ReferenceIntersector intersector)
         {
             var pt = node.WorldPos;
-            var dir = XYZ.BasisX;
 
-            var hits = intersector.Find(pt, dir);
-            if (hits == null || hits.Count == 0)
+            // Cast rays in all 6 directions.
+            // If an obstacle is found within half the step size — the node is inside it.
+            double halfStep = StepFt * 0.55; // slightly above 0.5 for reliability
+
+            foreach (var dir in RayDirs)
             {
-                hits = intersector.Find(pt, XYZ.BasisX.Negate());
-                if (hits == null || hits.Count == 0) return;
-            }
-
-            foreach (var hit in hits)
-            {
-                if (hit.Proximity > StepFt * 0.5) continue;
-
-                var elem = _doc.GetElement(hit.GetReference().ElementId);
-                if (elem == null) continue;
-
-                if (elem is Wall wall)
+                IList<ReferenceWithContext> hits;
+                try
                 {
-                    double thickFt = wall.WallType.Width;
-                    if (_maxPierceFt > 0 && thickFt <= _maxPierceFt)
-                    {
-                        node.Type = NodeType.SoftObstacle;
-                        node.WallThicknessFt = thickFt;
-                    }
-                    else
-                    {
-                        node.Type = NodeType.HardObstacle;
-                    }
-                    return;
+                    hits = intersector.Find(pt, dir);
+                }
+                catch
+                {
+                    continue; // ReferenceIntersector can throw at boundary conditions
                 }
 
-                node.Type = NodeType.HardObstacle;
-                return;
+                if (hits == null || hits.Count == 0) continue;
+
+                foreach (var hit in hits)
+                {
+                    // Only consider very close hits — the node is inside the element
+                    if (hit.Proximity > halfStep) continue;
+
+                    // FIXED: GetReference() can return null for some hit types — guard explicitly
+                    Reference reference;
+                    try { reference = hit.GetReference(); }
+                    catch { continue; }
+
+                    if (reference == null) continue;
+
+                    ElementId eid = reference.ElementId;
+                    if (eid == null || eid == ElementId.InvalidElementId) continue;
+
+                    Element elem = _doc.GetElement(eid);
+                    if (elem == null) continue;
+
+                    if (elem is Wall wall)
+                    {
+                        double thickFt = wall.WallType?.Width ?? 0;
+                        if (_maxPierceFt > 0 && thickFt > 0 && thickFt <= _maxPierceFt)
+                        {
+                            node.Type = NodeType.SoftObstacle;
+                            node.WallThicknessFt = thickFt;
+                        }
+                        else
+                        {
+                            node.Type = NodeType.HardObstacle;
+                        }
+                        return; // obstacle found — stop searching
+                    }
+
+                    // Everything else (column, floor, etc.) — hard obstacle
+                    node.Type = NodeType.HardObstacle;
+                    return;
+                }
             }
         }
 
-        // ── Анализ близости к поверхностям (для штрафа PSupport) ────
+        // ─────────────────────────────────────────────────────────────
         private void MarkSupportNodes()
         {
             int[] dx = { 1, -1, 0, 0, 0, 0 };
@@ -174,7 +204,6 @@ namespace BimPathfinder
 
                         bool near = false;
                         for (int d = 0; d < 6 && !near; d++)
-                        {
                             for (int s = 1; s <= supportSteps; s++)
                             {
                                 int nx2 = ix + dx[d] * s;
@@ -183,21 +212,18 @@ namespace BimPathfinder
 
                                 if (!InBounds(nx2, ny2, nz2)) { near = true; break; }
                                 if (_nodes[nx2, ny2, nz2].Type == NodeType.HardObstacle)
-                                {
-                                    near = true; break;
-                                }
+                                { near = true; break; }
                             }
-                        }
                         node.NearWall = near;
                     }
         }
 
-        // ── Публичные методы доступа ─────────────────────────────────
+        // ─────────────────────────────────────────────────────────────
+        // Public methods
+        // ─────────────────────────────────────────────────────────────
+
         public AStarNode GetNode(int ix, int iy, int iz)
-        {
-            if (!InBounds(ix, iy, iz)) return null;
-            return _nodes[ix, iy, iz];
-        }
+            => InBounds(ix, iy, iz) ? _nodes[ix, iy, iz] : null;
 
         public AStarNode GetNodeAt(XYZ worldPt)
         {

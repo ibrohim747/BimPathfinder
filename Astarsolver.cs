@@ -33,7 +33,7 @@ namespace BimPathfinder
             _openSet = new SortedSet<AStarNode>(Comparer<AStarNode>.Create(CompareNodes));
         }
 
-        // ── Компаратор для SortedSet ─────────────────────────────────
+        // ── SortedSet comparator ─────────────────────────────────────
         private static int CompareNodes(AStarNode a, AStarNode b)
         {
             double fa = TotalCost(a);
@@ -48,7 +48,7 @@ namespace BimPathfinder
         private static double TotalCost(AStarNode n)
             => n.G + n.H + n.PTurn + n.PSupport + n.PPierce;
 
-        // ── Эвристика (манхэттенское расстояние) ────────────────────
+        // ── Heuristic (Manhattan distance) ───────────────────────────
         private double Heuristic(AStarNode a, AStarNode goal)
         {
             return (Math.Abs(a.IX - goal.IX)
@@ -66,11 +66,11 @@ namespace BimPathfinder
 
             if (startNode == null || goalNode == null)
                 throw new InvalidOperationException(
-                    "Точки старта или финиша вне сетки.");
+                    "Start or end point is outside the grid.");
 
             if (goalNode.Type == NodeType.HardObstacle)
                 throw new InvalidOperationException(
-                    "Точка финиша находится внутри непроходимого препятствия.");
+                    "The end point is located inside an impassable obstacle.");
 
             startNode.G = 0;
             startNode.H = Heuristic(startNode, goalNode);
@@ -86,8 +86,8 @@ namespace BimPathfinder
             {
                 if (++iterations > MaxIterations)
                     throw new InvalidOperationException(
-                        $"A* превысил лимит итераций ({MaxIterations}). " +
-                        "Попробуйте увеличить шаг сетки или расширить MaxPiercingThickness.");
+                        $"A* exceeded the iteration limit ({MaxIterations}). " +
+                        "Try increasing the grid step or expanding MaxPiercingThickness.");
 
                 var current = _openSet.Min;
                 _openSet.Remove(current);
@@ -155,10 +155,10 @@ namespace BimPathfinder
             }
 
             throw new InvalidOperationException(
-                "Путь не найден. Проверьте наличие прохода между точками.");
+                "Path not found. Check that a passage exists between the points.");
         }
 
-        // ── Реконструкция пути ───────────────────────────────────────
+        // ── Path reconstruction ──────────────────────────────────────
         private List<XYZ> ReconstructPath(AStarNode goalNode, XYZ realStart, XYZ realEnd)
         {
             var pts = new List<XYZ>();
@@ -178,7 +178,7 @@ namespace BimPathfinder
             return pts;
         }
 
-        // ── Вспомогательные методы ───────────────────────────────────
+        // ── Helper methods ───────────────────────────────────────────
         private static bool IsParallel(XYZ a, XYZ b)
         {
             double dot = Math.Abs(a.DotProduct(b));

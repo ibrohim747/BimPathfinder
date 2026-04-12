@@ -12,28 +12,28 @@ namespace BimPathfinder
 
     internal sealed class AStarNode : IComparable<AStarNode>
     {
-        // ── Позиция в сетке ──────────────────────────────────────────
+        // ── Grid position ────────────────────────────────────────────
         public readonly int IX, IY, IZ;
         public readonly XYZ WorldPos;
 
-        // ── Тип и физические свойства ────────────────────────────────
+        // ── Type and physical properties ─────────────────────────────
         public NodeType Type;
         public double WallThicknessFt;
         public bool NearWall;
 
-        // ── A* стоимости ─────────────────────────────────────────────
-        public double G = double.MaxValue;  
-        public double H; 
-        public double F => G + H; 
+        // ── A* costs ─────────────────────────────────────────────────
+        public double G = double.MaxValue;
+        public double H;
+        public double F => G + H;
 
-        // ── Штрафы ───────────────────────────────────────────────────
-        public double PTurn;         
-        public double PSupport;                
-        public double PPierce;                
+        // ── Penalties ────────────────────────────────────────────────
+        public double PTurn;
+        public double PSupport;
+        public double PPierce;
 
-        // ── Навигация ────────────────────────────────────────────────
+        // ── Navigation ───────────────────────────────────────────────
         public AStarNode Parent;
-        public XYZ IncomingDirection;           
+        public XYZ IncomingDirection;
         public bool InOpenSet;
         public bool InClosedSet;
 

@@ -23,8 +23,8 @@ namespace BimPathfinder
 
             try
             {
-                // ── 1. Диалог настроек ───────────────────────────────
-                var dialog = new PathfinderDialog();
+                // ── 1. Settings dialog ───────────────────────────────
+                var dialog = new PathfinderDialog(doc);
                 dialog.ShowDialog();
 
                 if (!dialog.Confirmed)
@@ -36,118 +36,209 @@ namespace BimPathfinder
                 var settings = dialog.Settings;
                 var sysType = dialog.SystemType;
 
-                // ── 2. Выбор точек пользователем ────────────────────
+                // ── 2. FIXED: obtain View3D BEFORE picking points ────
+                // View3D is created in a separate transaction that is fully
+                // committed before it is passed to ReferenceIntersector —
+                // otherwise a NullReferenceException is thrown.
+                View3D view3D = GetOrCreate3DView(doc);
+                if (view3D == null)
+                    throw new InvalidOperationException(
+                        "Could not find or create a 3D view.\n" +
+                        "Open any orthographic 3D view in Revit and try again.");
+
+                // ── 3. Pick points ───────────────────────────────────
                 TaskDialog.Show("BIM-Pathfinder A*",
-                    "Кликните точку СТАРТА (коннектор или точка в модели).");
+                    "Click the START point (connector or a point in the model).");
 
                 XYZ startPt;
-                try { startPt = uiDoc.Selection.PickPoint("Укажите точку СТАРТА"); }
+                try { startPt = uiDoc.Selection.PickPoint("Pick the START point"); }
                 catch (Autodesk.Revit.Exceptions.OperationCanceledException)
                 { return Result.Cancelled; }
 
-                TaskDialog.Show("BIM-Pathfinder A*",
-                    "Теперь кликните точку ФИНИША.");
+                TaskDialog.Show("BIM-Pathfinder A*", "Now click the END point.");
 
                 XYZ endPt;
-                try { endPt = uiDoc.Selection.PickPoint("Укажите точку ФИНИША"); }
+                try { endPt = uiDoc.Selection.PickPoint("Pick the END point"); }
                 catch (Autodesk.Revit.Exceptions.OperationCanceledException)
                 { return Result.Cancelled; }
 
-                // ── 3. Определение уровня и View3D ──────────────────
+                // ── 4. Level ─────────────────────────────────────────
                 var level = GetActiveLevel(doc, startPt);
-                var view3D = GetOrCreate3DView(doc, uiApp.ActiveUIDocument);
-
                 double zMin = level.ProjectElevation;
                 double zMax = GetNextLevelElevation(doc, level);
 
                 var adjustedStart = new XYZ(startPt.X, startPt.Y,
-                    Math.Max(startPt.Z, zMin));
+                    Clamp(startPt.Z, zMin, zMax));
                 var adjustedEnd = new XYZ(endPt.X, endPt.Y,
-                    Math.Max(endPt.Z, zMin));
+                    Clamp(endPt.Z, zMin, zMax));
 
-                // ── 4. Построение воксельной сетки ──────────────────
-                using (var progress = new ProgressHelper("BIM-Pathfinder A*"))
+                // ── 5. FIXED: VoxelGrid with null guard ───────────────
+                VoxelGrid grid;
+                AStarSolver solver;
+                List<XYZ> rawPath;
+
+                try
                 {
-                    progress.Report("Построение воксельной сетки...");
-
-                    var grid = new VoxelGrid(
+                    grid = new VoxelGrid(
                         doc, view3D,
                         new XYZ(adjustedStart.X, adjustedStart.Y, zMin),
                         new XYZ(adjustedEnd.X, adjustedEnd.Y, zMax),
                         maxPierceMm, stepMm);
 
-                    progress.Report("Анализ препятствий...");
                     grid.AnalyzeObstacles();
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Error building the voxel grid:\n{ex.Message}\n\n" +
+                        "Make sure walls and floors are not hidden in the 3D view.", ex);
+                }
 
-                    // ── 5. Поиск пути A* ─────────────────────────────
-                    progress.Report("Поиск пути A*...");
+                // ── 6. A* ────────────────────────────────────────────
+                try
+                {
+                    solver = new AStarSolver(grid, settings);
+                    rawPath = solver.FindPath(adjustedStart, adjustedEnd);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    TaskDialog.Show("BIM-Pathfinder A* — Path Not Found", ex.Message);
+                    return Result.Failed;
+                }
 
-                    var solver = new AStarSolver(grid, settings);
-                    var rawPath = solver.FindPath(adjustedStart, adjustedEnd);
+                // ── 7. Simplification ────────────────────────────────
+                var simplePath = PathSimplifier.FullSimplify(rawPath, grid.StepFt);
 
-                    // ── 6. Упрощение пути ────────────────────────────
-                    progress.Report("Упрощение пути...");
-                    var simplePath = PathSimplifier.FullSimplify(rawPath, grid.StepFt);
+                if (simplePath == null || simplePath.Count < 2)
+                    throw new InvalidOperationException(
+                        "The path is too short after simplification.\n" +
+                        "Choose points that are farther apart.");
 
-                    if (simplePath.Count < 2)
-                        throw new InvalidOperationException(
-                            "Путь слишком короткий после упрощения.");
+                // ── 8. Create MEP elements ───────────────────────────
+                using (var tx = new Transaction(doc, "BIM-Pathfinder: create route"))
+                {
+                    tx.Start();
 
-                    // ── 7. Генерация элементов в Revit ───────────────
-                    progress.Report("Генерация элементов MEP...");
+                    var builder = new RevitBuilder(doc, level);
 
-                    using (var tx = new Transaction(doc, "BIM-Pathfinder: создание трассы"))
+                    if (sysType == MepSystemType.Pipe)
                     {
-                        tx.Start();
-
-                        var builder = new RevitBuilder(doc, level);
-
-                        if (sysType == MepSystemType.Pipe)
-                        {
-                            var pipeType = RevitBuilder.GetFirstPipeType(doc);
-                            var pipeSysType = RevitBuilder.GetPipingSystemType(doc);
-                            builder.BuildPipes(simplePath, pipeType, pipeSysType, diamMm);
-                        }
-                        else
-                        {
-                            var ductType = RevitBuilder.GetFirstDuctType(doc);
-                            var mechSysType = RevitBuilder.GetMechSystemType(doc);
-                            builder.BuildDucts(simplePath, ductType, mechSysType,
-                                               diamMm, diamMm * 0.6); // высота = 60% ширины
-                        }
-
-                        tx.Commit();
+                        var pipeType = dialog.SelectedPipeType
+                                          ?? RevitBuilder.GetFirstPipeType(doc);
+                        var pipeSysType = RevitBuilder.GetPipingSystemType(doc);
+                        builder.BuildPipes(simplePath, pipeType, pipeSysType, diamMm);
+                    }
+                    else
+                    {
+                        var ductType = dialog.SelectedDuctType
+                                          ?? RevitBuilder.GetFirstDuctType(doc);
+                        var mechSysType = RevitBuilder.GetMechSystemType(doc);
+                        builder.BuildDucts(simplePath, ductType, mechSysType,
+                                           diamMm, diamMm * 0.6);
                     }
 
-                    // ── 8. Предупреждение о пробивках ────────────────
-                    var piercePoints = solver.GetPiercedWallPoints(simplePath);
-                    if (piercePoints.Count > 0)
-                        RevitBuilder.ShowPierceWarning(doc, piercePoints);
-
-                    // ── 9. Итоговое сообщение ─────────────────────────
-                    TaskDialog.Show("BIM-Pathfinder A* — Готово",
-                        $"Трасса построена успешно.\n" +
-                        $"Сегментов: {simplePath.Count - 1}\n" +
-                        $"Точек поворота: {simplePath.Count - 2}\n" +
-                        $"Пробивок стен: {piercePoints.Count}");
+                    tx.Commit();
                 }
+
+                // ── 9. Wall penetrations ─────────────────────────────
+                var solver2 = new AStarSolver(grid, settings);
+                var piercePoints = solver2.GetPiercedWallPoints(simplePath);
+                if (piercePoints.Count > 0)
+                    RevitBuilder.ShowPierceWarning(doc, piercePoints);
+
+                TaskDialog.Show("BIM-Pathfinder A* — Done",
+                    $"Route created successfully.\n" +
+                    $"Segments: {simplePath.Count - 1}\n" +
+                    $"Turn points: {Math.Max(0, simplePath.Count - 2)}\n" +
+                    $"Wall penetrations: {piercePoints.Count}");
 
                 return Result.Succeeded;
             }
             catch (InvalidOperationException ex)
             {
                 message = ex.Message;
-                TaskDialog.Show("BIM-Pathfinder A* — Ошибка", ex.Message);
+                TaskDialog.Show("BIM-Pathfinder A* — Error", ex.Message);
                 return Result.Failed;
             }
             catch (Exception ex)
             {
-                message = $"Непредвиденная ошибка: {ex.Message}";
-                TaskDialog.Show("BIM-Pathfinder A* — Ошибка", message);
+                message = $"Unexpected error: {ex.Message}";
+                TaskDialog.Show("BIM-Pathfinder A* — Error",
+                    $"{message}\n\nStack:\n{ex.StackTrace}");
                 return Result.Failed;
             }
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // FIXED: GetOrCreate3DView
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns an existing orthographic 3D view.
+        /// If none is found — creates one in a SEPARATE committed transaction.
+        ///
+        /// Key fixes:
+        /// 1. Search for an existing view first — avoid creating duplicates.
+        /// 2. If creating — the transaction is fully committed BEFORE
+        ///    the object is returned. Otherwise ReferenceIntersector receives
+        ///    an invalid element and throws NullReferenceException.
+        /// 3. Far Clipping is disabled — required for ReferenceIntersector.
+        /// </summary>
+        private static View3D GetOrCreate3DView(Document doc)
+        {
+            const string pluginViewName = "BIM-Pathfinder_RayTrace";
+
+            // Step 1: look for the plugin's dedicated view
+            var special = new FilteredElementCollector(doc)
+                .OfClass(typeof(View3D))
+                .Cast<View3D>()
+                .FirstOrDefault(v =>
+                    !v.IsTemplate && !v.IsPerspective && v.Name == pluginViewName);
+            if (special != null) return special;
+
+            // Step 2: any orthographic 3D view
+            var anyOrtho = new FilteredElementCollector(doc)
+                .OfClass(typeof(View3D))
+                .Cast<View3D>()
+                .FirstOrDefault(v => !v.IsTemplate && !v.IsPerspective);
+            if (anyOrtho != null) return anyOrtho;
+
+            // Step 3: create a new one in its own transaction
+            var vft = new FilteredElementCollector(doc)
+                .OfClass(typeof(ViewFamilyType))
+                .Cast<ViewFamilyType>()
+                .FirstOrDefault(t => t.ViewFamily == ViewFamily.ThreeDimensional);
+
+            if (vft == null) return null;
+
+            View3D created = null;
+            using (var tx = new Transaction(doc, "BIM-Pathfinder: 3D view"))
+            {
+                tx.Start();
+                try
+                {
+                    created = View3D.CreateIsometric(doc, vft.Id);
+                    created.Name = pluginViewName;
+
+                    // Disable Far Clipping.
+                    // Without this ReferenceIntersector cannot see distant elements.
+                    var farClip = created.get_Parameter(
+                        BuiltInParameter.VIEWER_BOUND_ACTIVE_FAR);
+                    farClip?.Set(0); // 0 = No clip
+
+                    tx.Commit();
+                }
+                catch
+                {
+                    tx.RollBack();
+                    return null;
+                }
+            }
+
+            return created;
+        }
+
+        // ─────────────────────────────────────────────────────────────
         private static Level GetActiveLevel(Document doc, XYZ pt)
         {
             var levels = new FilteredElementCollector(doc)
@@ -156,65 +247,37 @@ namespace BimPathfinder
                 .OrderBy(l => l.ProjectElevation)
                 .ToList();
 
+            if (levels.Count == 0)
+                throw new InvalidOperationException("The project contains no levels.");
+
             return levels.LastOrDefault(l => l.ProjectElevation <= pt.Z + 1e-3)
-                ?? levels.FirstOrDefault()
-                ?? throw new InvalidOperationException("В проекте нет уровней.");
+                ?? levels.First();
         }
 
         private static double GetNextLevelElevation(Document doc, Level current)
         {
-            var levels = new FilteredElementCollector(doc)
+            var next = new FilteredElementCollector(doc)
                 .OfClass(typeof(Level))
                 .Cast<Level>()
                 .OrderBy(l => l.ProjectElevation)
-                .ToList();
-
-            var next = levels.FirstOrDefault(l =>
-                l.ProjectElevation > current.ProjectElevation + 1e-3);
+                .FirstOrDefault(l =>
+                    l.ProjectElevation > current.ProjectElevation + 1e-3);
 
             return next?.ProjectElevation
-                ?? (current.ProjectElevation + 3000 / 304.8);
+                ?? (current.ProjectElevation + 3000.0 / 304.8);
         }
 
-        private static View3D GetOrCreate3DView(Document doc, UIDocument uiDoc)
-        {
-            var existing = new FilteredElementCollector(doc)
-                .OfClass(typeof(View3D))
-                .Cast<View3D>()
-                .FirstOrDefault(v => !v.IsTemplate && !v.IsPerspective);
-
-            if (existing != null) return existing;
-
-            View3D view3D;
-            using (var tx = new Transaction(doc, "BIM-Pathfinder: создание 3D вида"))
-            {
-                tx.Start();
-                var viewFamilyType = new FilteredElementCollector(doc)
-                    .OfClass(typeof(ViewFamilyType))
-                    .Cast<ViewFamilyType>()
-                    .First(t => t.ViewFamily == ViewFamily.ThreeDimensional);
-
-                view3D = View3D.CreateIsometric(doc, viewFamilyType.Id);
-                view3D.Name = "BIM-Pathfinder_Temp";
-                tx.Commit();
-            }
-
-            return view3D;
-        }
+        private static double Clamp(double v, double min, double max)
+            => v < min ? min : v > max ? max : v;
     }
 
+    // ─────────────────────────────────────────────────────────────────
     internal sealed class ProgressHelper : IDisposable
     {
         private readonly string _title;
-
         public ProgressHelper(string title) { _title = title; }
-
-        public void Report(string message)
-        {
-
-            System.Diagnostics.Debug.WriteLine($"[{_title}] {message}");
-        }
-
+        public void Report(string msg) =>
+            System.Diagnostics.Debug.WriteLine($"[{_title}] {msg}");
         public void Dispose() { }
     }
 }
